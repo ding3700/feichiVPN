@@ -1,0 +1,75 @@
+name: Build VPNAdBlock.dylib
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 环境自检
+        run: |
+          echo "--- 仓库文件 ---"
+          ls -la
+          echo "--- SDK ---"
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: 安装签名工具
+        run: |
+          brew install ldid 2>/dev/null || true
+          which ldid || echo "ldid 不可用，将改用 codesign"
+
+      # 不用 theos，直接用 Xcode 自带 clang
+      # CoreGraphics 必须显式链接：CGRectZero 在它里面
+      - name: 编译 dylib（不用 theos）
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK = $SDK"
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -dynamiclib \
+            -fobjc-arc \
+            -Wno-error \
+            -Wno-deprecated-declarations \
+            -Wno-unused-variable \
+            -miphoneos-version-min=12.0 \
+            -isysroot "$SDK" \
+            -framework UIKit \
+            -framework Foundation \
+            -framework CoreMotion \
+            -framework CoreFoundation \
+            -framework CoreGraphics \
+            -install_name @executable_path/Frameworks/VPNAdBlock.dylib \
+            -o VPNAdBlock.dylib \
+            VPNAdBlock.m
+
+      - name: 签名
+        run: |
+          if command -v ldid >/dev/null 2>&1; then
+            ldid -S VPNAdBlock.dylib
+            echo "已用 ldid 签名"
+          else
+            codesign --force --sign - VPNAdBlock.dylib
+            echo "已用 codesign 临时签名"
+          fi
+
+      - name: 校验产物
+        run: |
+          ls -la VPNAdBlock.dylib
+          file VPNAdBlock.dylib
+          echo "--- 架构确认（须含 arm64）---"
+          lipo -info VPNAdBlock.dylib 2>/dev/null || true
+          echo "--- 依赖检查（有 substrate 说明异常）---"
+          otool -L VPNAdBlock.dylib
+          echo "--- install_name ---"
+          otool -D VPNAdBlock.dylib
+
+      - name: 上传 dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: VPNAdBlock
+          path: VPNAdBlock.dylib
