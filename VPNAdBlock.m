@@ -1,16 +1,15 @@
-/* VPNAdBlock v11 —— 零闪现版
+/* VPNAdBlock v12 —— 零闪现 + 自动关闭
  *
- * v10 问题：定时清扫是"渲染后再隐藏"，所以有可见窗口（闪现）
+ * v11 已解决：banner 零闪现、推荐面板全程透明
+ * v11 遗留：透明面板的「系统遮罩容器」仍在拦截点击，需多点一次
  *
- * v11 解法：把拦截点提前到渲染之前
- *   ① banner：hook UIView 的 didAddSubview:
- *      —— 广告 view 被加入视图树的瞬间就 hidden，从未被渲染过
- *      —— 这是 UIKit 里能达到的最早时机
- *   ② 推荐面板：hook viewWillAppear: 先设 alpha=0
- *      —— 整个弹出动画期间完全透明，viewDidAppear 后再 hidden
+ * v12 新增：隐藏 view 后主动 dismiss
+ *   注意区分两种操作：
+ *     拦截 present  —— present 从未发生，Swift 强解包 presentedViewController 会崩
+ *     present 后 dismiss —— 等价于用户手动关闭，Swift 自己就在等这个动作，安全
  *
- * 性能：类名结果进缓存字典，之后每次只是一次字典查找。
- *      所有 UI 操作都在主线程，无需加锁。
+ *   现在 sheet 已走完 willAppear→didAppear 全流程，dismiss 属于正常生命周期操作。
+ *   用 animated:NO 避免关闭动画期间访问已释放的转场上下文。
  */
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -24,8 +23,12 @@
 //  3 = banner + 推荐面板  ★
 #define VPN_LEVEL 3
 
-// 即时隐藏（零闪现核心）。若发现正常 UI 被误隐藏，改 0 退回定时清扫
+// 即时隐藏（零闪现核心）
 #define INSTANT_HIDE 1
+
+// 隐藏后自动 dismiss（消除多余点击）
+// 若发现关闭瞬间闪退，改 0 退回「只隐藏」
+#define DISMISS_SHEET 1
 
 #define VPN_DEBUG 1
 static const NSTimeInterval kSensorBlockSeconds = 10.0;
@@ -92,7 +95,6 @@ static BOOL VPNIsKitClass(NSString *cls) {
     return ([cls hasPrefix:@"UI"] || [cls hasPrefix:@"CA"] || [cls hasPrefix:@"NS"] ||
             [cls hasPrefix:@"WK"] || [cls hasPrefix:@"SwiftUI"] || [cls hasPrefix:@"Swift."]);
 }
-
 static BOOL VPNIsBannerName(NSString *cls) {
     if (cls.length == 0) return NO;
     if (VPNIsKitClass(cls)) return NO;
@@ -106,7 +108,7 @@ static BOOL VPNIsSheetVC(NSString *cls) {
     return VPNHit(cls, SHEET_KEYS);
 }
 
-#pragma mark - 类名缓存（didAddSubview 高频调用，必须缓存）
+#pragma mark - 类名缓存
 
 static NSMutableDictionary *gClsCache;
 static BOOL VPNIsBannerCached(NSString *cls) {
@@ -152,7 +154,7 @@ static NSArray *VPNWindows(void) {
     return out;
 }
 
-#pragma mark - 兜底清扫（定时，覆盖 didAddSubview 漏掉的情况）
+#pragma mark - 兜底清扫
 
 static void VPNSweep(UIView *root, int depth) {
     if (!root || depth > 10) return;
@@ -171,7 +173,7 @@ static void VPNSweepAll(void) {
     }
 }
 
-#pragma mark - ① 零闪现核心：didAddSubview 即时隐藏
+#pragma mark - ① 零闪现：didAddSubview 即时隐藏
 
 static void VPNHookAddSubview(void) {
     Class V = [UIView class];
@@ -186,7 +188,6 @@ static void VPNHookAddSubview(void) {
             if (!sub) return;
             NSString *cls = NSStringFromClass([sub class]);
             if (VPNIsBannerCached(cls)) {
-                // 此刻尚未渲染，直接隐藏 → 屏幕上永不出现
                 sub.hidden = YES;
                 sub.alpha = 0.0;
                 sub.userInteractionEnabled = NO;
@@ -199,7 +200,7 @@ static void VPNHookAddSubview(void) {
     VPNLog(@"hooked UIView didAddSubview:");
 }
 
-#pragma mark - ② 推荐面板：willAppear 预置透明 + didAppear 隐藏
+#pragma mark - ② 推荐面板：willAppear 透明 → didAppear 隐藏 → dismiss
 
 static void VPNHookViewWillAppear(void) {
     Class VC = objc_getClass("UIViewController");
@@ -241,11 +242,32 @@ static void VPNHookViewDidAppear(void) {
                     UIViewController *vc = weakVC;
                     if (!vc) return;
                     UIView *v = vc.view;
-                    if (!v || v.isHidden) return;
-                    VPNLog([NSString stringWithFormat:@"HIDE[sheet]: %@", vcName]);
-                    v.hidden = YES;
-                    v.alpha = 0.0;
-                    v.userInteractionEnabled = NO;
+                    if (v && !v.isHidden) {
+                        VPNLog([NSString stringWithFormat:@"HIDE[sheet]: %@", vcName]);
+                        v.hidden = YES;
+                        v.alpha = 0.0;
+                        v.userInteractionEnabled = NO;
+                    }
+
+#if DISMISS_SHEET
+                    // 再延迟一拍，确保转场上下文完全稳定后再关闭
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{
+                        @try {
+                            UIViewController *cur = weakVC;
+                            if (!cur) return;
+                            // 只有仍处于被 present 状态才关闭
+                            if (cur.presentingViewController || cur.navigationController) {
+                                VPNLog([NSString stringWithFormat:@"SHEET dismiss: %@", vcName]);
+                                [cur dismissViewControllerAnimated:NO completion:nil];
+                            } else {
+                                VPNLog(@"SHEET skip dismiss: no presenting VC");
+                            }
+                        } @catch (NSException *e) {
+                            VPNLog(@"dismiss exception (ignored)");
+                        }
+                    });
+#endif
                 });
             }
 #endif
@@ -280,16 +302,15 @@ static void VPNHookSensors(void) {
 __attribute__((constructor))
 static void VPNEntry(void) {
     gStart = CFAbsoluteTimeGetCurrent();
-    VPNLog([NSString stringWithFormat:@"========== VPNAdBlock v11 loaded, LEVEL=%d ==========", VPN_LEVEL]);
+    VPNLog([NSString stringWithFormat:@"========== VPNAdBlock v12 loaded, LEVEL=%d ==========", VPN_LEVEL]);
 
     dispatch_async(dispatch_get_main_queue(), ^{
         VPNHookSensors();
-        VPNHookAddSubview();      // 零闪现核心，必须尽早
+        VPNHookAddSubview();
         VPNHookViewWillAppear();
         VPNHookViewDidAppear();
     });
 
-    // 兜底清扫（didAddSubview 万一漏掉）
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ VPNSweepAll(); });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
@@ -309,12 +330,21 @@ static void VPNEntry(void) {
                         top = top.presentedViewController;
                     }
                     NSString *tn = NSStringFromClass([top class]);
-                    if (VPNIsSheetVC(tn) && top.view && !top.view.isHidden) {
-                        VPNLogOnce([@"fb|" stringByAppendingString:tn],
-                                   [NSString stringWithFormat:@"HIDE[sheet-fallback]: %@", tn]);
-                        top.view.hidden = YES;
-                        top.view.alpha = 0.0;
-                        top.view.userInteractionEnabled = NO;
+                    if (VPNIsSheetVC(tn)) {
+                        if (top.view && !top.view.isHidden) {
+                            VPNLogOnce([@"fb|" stringByAppendingString:tn],
+                                       [NSString stringWithFormat:@"HIDE[sheet-fb]: %@", tn]);
+                            top.view.hidden = YES;
+                            top.view.alpha = 0.0;
+                            top.view.userInteractionEnabled = NO;
+                        }
+#if DISMISS_SHEET
+                        if (top.presentingViewController) {
+                            VPNLogOnce([@"fbd|" stringByAppendingString:tn],
+                                       [NSString stringWithFormat:@"SHEET dismiss-fb: %@", tn]);
+                            [top dismissViewControllerAnimated:NO completion:nil];
+                        }
+#endif
                     }
                 }
             } @catch (NSException *e) {}
