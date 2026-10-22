@@ -1,14 +1,17 @@
-/* VPNAdBlock v9 —— 全量诊断版
+/* VPNAdBlock v10 —— 飞驰 VPN（XunchiVPN）去广告插件 · 最终版
  *
- * v8 教训：dump 过滤了系统类 → 开屏页全是系统视图 → dump 空
- *          2秒时还在 SplashViewController → 没抓到首页
- * v7 教训：5次启动 20次清扫，零命中 → 类名确实匹配不上
+ * 实测确认的类名：
+ *   首页顶部/底部 banner = ...18HomeBannerCarousel   ✅ 已验证（顶 y=61 / 底 y=770）
+ *   推荐面板（点连接 / 签到后从下弹出）
+ *             = ...34RecommendationsSheetViewController  ★ v10 新增
+ *   绝不处理：RewardCelebrationView / FloatingClaimButton（正常功能）
  *
- * v9 关键修正：
- *   ① dump 不过滤任何类（包括 "_" 开头的 SwiftUI 视图）
- *   ② 加「类名普查」：收集视图树所有类名，最后整体输出
- *   ③ 多时间点：3/6/10秒 + viewDidAppear，确保抓到首页
- *   ④ 记录每个出现的 VC 名
+ * 策略：
+ *   banner   —— 视图树匹配后 hidden（不移除，防 Auto Layout 崩）
+ *   推荐面板 —— viewDidAppear 完成 0.6s 后隐藏其 view
+ *               （不 dismiss、不拦截 present，避免 Swift 强解包崩溃）
+ *
+ * 日志：Documents/vpn_adblock.log
  */
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -16,9 +19,13 @@
 #import <CoreMotion/CoreMotion.h>
 #import <CoreFoundation/CoreFoundation.h>
 
-#define VPN_LEVEL 2
+#pragma mark - ============ 开关 ============
+
+//  2 = 只清首页 banner
+//  3 = + 推荐面板拦截  ★ 推荐用这个
+#define VPN_LEVEL 3
+
 #define VPN_DEBUG 1
-#define SHOW_BADGE 1
 static const NSTimeInterval kSensorBlockSeconds = 10.0;
 
 #pragma mark - 日志
@@ -26,9 +33,7 @@ static const NSTimeInterval kSensorBlockSeconds = 10.0;
 static NSString *VPNPath(NSString *k) {
     if ([k isEqualToString:@"doc"])
         return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"vpn_adblock.log"];
-    if ([k isEqualToString:@"cache"])
-        return [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"vpn_adblock.log"];
-    return [NSTemporaryDirectory() stringByAppendingPathComponent:@"vpn_adblock.log"];
+    return [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"vpn_adblock.log"];
 }
 static CFAbsoluteTime gStart = 0;
 
@@ -39,18 +44,20 @@ static void VPNLog(NSString *line) {
     dispatch_once(&once, ^{ fmt = [[NSDateFormatter alloc] init]; fmt.dateFormat = @"HH:mm:ss.SSS"; });
     NSString *out = [NSString stringWithFormat:@"[%@] %@\n", [fmt stringFromDate:[NSDate date]], line];
     NSLog(@"[VPNAdBlock] %@", line);
-    for (NSString *k in @[@"doc", @"cache", @"tmp"]) {
-        NSString *p = VPNPath(k);
-        NSFileManager *fm = [NSFileManager defaultManager];
-        if (![fm fileExistsAtPath:p]) [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    NSString *p = VPNPath(@"doc");
+    if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
-        if (!fh) continue;
-        [fh seekToEndOfFile];
-        [fh writeData:[out dataUsingEncoding:NSUTF8StringEncoding]];
-        [fh closeFile];
+        if (fh) {
+            [fh seekToEndOfFile];
+            [fh writeData:[out dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+            return;
+        }
     }
+    [out writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
 #endif
 }
+
 static NSMutableSet *gLogged;
 static void VPNLogOnce(NSString *key, NSString *line) {
     static dispatch_once_t once;
@@ -62,41 +69,59 @@ static void VPNLogOnce(NSString *key, NSString *line) {
     VPNLog(line);
 }
 
-#pragma mark - 类名匹配（清扫用）
+#pragma mark - 类名（已实测锁定）
 
+// 首页 banner
 static NSString * const BANNER_KEYS[] = {
-    @"HomeBannerCell", @"HomeBannerCarousel", @"HomeBanner",
-    @"BannerCell", @"BannerCarousel", @"BannerView", nil
+    @"HomeBannerCarousel",
+    @"HomeBannerCell",
+    nil
+};
+// 推荐面板（真凶）
+static NSString * const SHEET_KEYS[] = {
+    @"RecommendationsSheet",
+    nil
+};
+// 绝不碰：正常功能（签到领奖、浮动领会员按钮）
+static NSString * const SAFE_KEYS[] = {
+    @"RewardCelebration", @"FloatingClaim", @"Claim", @"Reward",
+    @"Sign", @"CheckIn", @"Member", @"Vip", nil
 };
 static NSString * const EXCLUDE[] = {
     @"Address", @"Adapter", @"Adaptor", @"Advanced", @"Advisory",
     @"Add", @"Read", @"Load", @"Shadow", @"Gradient", @"Badge", @"Header", @"Trade", nil
 };
+
 static BOOL VPNHit(NSString *cls, NSString *const keys[]) {
     if (cls.length == 0) return NO;
-    for (int i = 0; keys[i]; i++) if ([cls rangeOfString:keys[i]].length > 0) return YES;
+    for (int i = 0; keys[i]; i++) {
+        if ([cls rangeOfString:keys[i]].length > 0) return YES;
+    }
     return NO;
 }
-// 注意：这里只排除明确的 UIKit/Foundation 前缀，
-// 不再排除 "_" 开头的 Swift 类型
 static BOOL VPNIsKitClass(NSString *cls) {
     return ([cls hasPrefix:@"UI"] || [cls hasPrefix:@"CA"] || [cls hasPrefix:@"NS"] ||
             [cls hasPrefix:@"WK"] || [cls hasPrefix:@"SwiftUI"] || [cls hasPrefix:@"Swift."]);
 }
+static BOOL VPNIsSafe(NSString *cls) { return VPNHit(cls, SAFE_KEYS); }
+
 static BOOL VPNIsBanner(UIView *v) {
     if (!v) return NO;
     NSString *cls = NSStringFromClass([v class]);
-    if (VPNIsKitClass(cls)) return NO;
-    if (VPNHit(cls, EXCLUDE)) return NO;
+    if (VPNIsKitClass(cls) || VPNIsSafe(cls) || VPNHit(cls, EXCLUDE)) return NO;
     return VPNHit(cls, BANNER_KEYS);
 }
+static BOOL VPNIsSheetVC(NSString *cls) {
+    if (cls.length == 0) return NO;
+    if (VPNIsSafe(cls)) return NO;
+    return VPNHit(cls, SHEET_KEYS);
+}
 
-#pragma mark - 隐藏
+#pragma mark - 隐藏（只 hidden，不移除、不改 frame）
 
 static void VPNHideView(UIView *v, NSString *reason) {
     if (!v || v.isHidden) return;
-    VPNLog([NSString stringWithFormat:@"HIDE[%@]: %@ frame=%@", reason,
-            NSStringFromClass([v class]), NSStringFromCGRect(v.frame)]);
+    VPNLog([NSString stringWithFormat:@"HIDE[%@]: %@", reason, NSStringFromClass([v class])]);
     v.hidden = YES;
     v.alpha = 0.0;
     v.userInteractionEnabled = NO;
@@ -110,98 +135,22 @@ static NSArray *VPNWindows(void) {
         if (@available(iOS 13.0, *)) {
             for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
                 if (![s isKindOfClass:[UIWindowScene class]]) continue;
-                for (UIWindow *w in ((UIWindowScene *)s).windows) if (w) [out addObject:w];
+                for (UIWindow *w in ((UIWindowScene *)s).windows) {
+                    if (w) [out addObject:w];
+                }
             }
         }
-    } @catch (NSException *e) { VPNLog(@"win err"); }
+    } @catch (NSException *e) {}
     if (out.count == 0) {
-        @try { UIWindow *w = [UIApplication sharedApplication].keyWindow; if (w) [out addObject:w]; } @catch (NSException *e) {}
+        @try {
+            UIWindow *w = [UIApplication sharedApplication].keyWindow;
+            if (w) [out addObject:w];
+        } @catch (NSException *e) {}
     }
     return out;
 }
 
-#pragma mark - 全量 dump + 类名普查
-
-static int gDumpN;
-static NSMutableSet *gCensus;
-
-static void VPNDumpTree(UIView *root, int depth) {
-    if (!root || depth > 10 || gDumpN > 400) return;
-    NSMutableString *pad = [NSMutableString string];
-    for (int i = 0; i < depth; i++) [pad appendString:@"  "];
-
-    NSString *cls = NSStringFromClass([root class]);
-    @synchronized (gCensus) { [gCensus addObject:cls]; }
-
-    NSString *mark = VPNIsBanner(root) ? @"  <<<BANNER" : @"";
-    NSString *hid = root.isHidden ? @" [hidden]" : @"";
-    VPNLog([NSString stringWithFormat:@"%@%@%@%@%@", pad, cls,
-            NSStringFromCGRect(root.frame), mark, hid]);
-    gDumpN++;
-
-    @try {
-        for (UIView *sub in root.subviews) VPNDumpTree(sub, depth + 1);
-    } @catch (NSException *e) {}
-}
-
-static void VPNDumpNow(NSString *tag) {
-    @try {
-        static dispatch_once_t once;
-        dispatch_once(&once, ^{ gCensus = [[NSMutableSet alloc] init]; });
-
-        gDumpN = 0;
-        NSArray *wins = VPNWindows();
-        VPNLog([NSString stringWithFormat:@"===== DUMP %@ windows=%lu =====", tag, (unsigned long)wins.count]);
-        for (UIWindow *w in wins) {
-            VPNLog([NSString stringWithFormat:@"[WIN] %@ level=%.1f root=%@ frame=%@",
-                    NSStringFromClass([w class]), w.windowLevel,
-                    NSStringFromClass([w.rootViewController class]),
-                    NSStringFromCGRect(w.frame)]);
-            VPNDumpTree(w, 1);
-        }
-        VPNLog(@"===== DUMP END =====");
-
-        // 类名普查：把所有出现过的类名整体输出，不管多深
-        NSArray *all = nil;
-        @synchronized (gCensus) { all = [[gCensus allObjects] sortedArrayUsingSelector:@selector(compare:)]; }
-        NSMutableString *buf = [NSMutableString string];
-        [buf appendFormat:@"===== CENSUS %@ (%lu) =====\n", tag, (unsigned long)all.count];
-        for (NSString *c in all) [buf appendFormat:@"  %@\n", c];
-        [buf appendString:@"===== CENSUS END ====="];
-        VPNLog(buf);
-    } @catch (NSException *e) { VPNLog(@"dump err"); }
-}
-
-#pragma mark - 角标（加到已有 window）
-
-#if SHOW_BADGE
-static NSMutableArray *gBadgeLabels;
-static void VPNShowBadge(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @try {
-            if (!gBadgeLabels) gBadgeLabels = [NSMutableArray array];
-            if (gBadgeLabels.count > 0) return;
-            UIWindow *w = nil;
-            @try { w = [UIApplication sharedApplication].keyWindow; } @catch (NSException *e) {}
-            if (!w) w = VPNWindows().firstObject;
-            if (!w) return;
-            UILabel *lb = [[UILabel alloc] initWithFrame:CGRectMake(8, 70, 130, 32)];
-            lb.text = @"VPN-OK";
-            lb.textColor = [UIColor blackColor];
-            lb.backgroundColor = [[UIColor greenColor] colorWithAlphaComponent:0.95];
-            lb.font = [UIFont boldSystemFontOfSize:15];
-            lb.textAlignment = NSTextAlignmentCenter;
-            lb.userInteractionEnabled = NO;
-            [w addSubview:lb];
-            [w bringSubviewToFront:lb];
-            [gBadgeLabels addObject:lb];
-            VPNLog([NSString stringWithFormat:@"BADGE added to %@", NSStringFromClass([w class])]);
-        } @catch (NSException *e) { VPNLog(@"badge err"); }
-    });
-}
-#endif
-
-#pragma mark - 清扫
+#pragma mark - banner 清扫
 
 static void VPNSweep(UIView *root, int depth) {
     if (!root || depth > 10) return;
@@ -220,7 +169,7 @@ static void VPNSweepAll(void) {
     }
 }
 
-#pragma mark - viewDidAppear：抓每个页面
+#pragma mark - 推荐面板拦截
 
 static void VPNHookViewController(void) {
     Class VC = objc_getClass("UIViewController");
@@ -232,22 +181,36 @@ static void VPNHookViewController(void) {
         if (o) ((void (*)(id, SEL, BOOL))o)(self, @selector(viewDidAppear:), animated);
         @try {
             NSString *vcName = NSStringFromClass([self class]);
-            VPNLogOnce([@"vc|" stringByAppendingString:vcName],
-                       [NSString stringWithFormat:@"VCApp: %@", vcName]);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                VPNDumpNow(vcName);
-                VPNSweepAll();
-#if SHOW_BADGE
-                VPNShowBadge();
+
+#if VPN_LEVEL >= 3
+            // 推荐面板：等展示动画完成后再隐藏 view
+            // 不 dismiss、不拦 present —— 那会触发 Swift 生命周期强解包崩溃
+            if (VPNIsSheetVC(vcName)) {
+                VPNLogOnce([@"sheet|" stringByAppendingString:vcName],
+                           [NSString stringWithFormat:@"SHEET detected: %@", vcName]);
+                __weak UIViewController *weakVC = (UIViewController *)self;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    UIViewController *vc = weakVC;
+                    if (!vc) return;
+                    UIView *v = vc.view;
+                    if (!v || v.isHidden) return;
+                    VPNLog([NSString stringWithFormat:@"HIDE[sheet]: %@", vcName]);
+                    v.hidden = YES;
+                    v.alpha = 0.0;
+                    v.userInteractionEnabled = NO;
+                });
+            }
 #endif
-            });
+            // 每个页面出现后补扫一次 banner（覆盖懒加载轮播）
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ VPNSweepAll(); });
         } @catch (NSException *e) {}
     }));
     VPNLog(@"hooked viewDidAppear");
 }
 
-#pragma mark - 传感器
+#pragma mark - 传感器（摇一摇）
 
 static BOOL VPNInSensorWindow(void) {
     if (gStart == 0) return YES;
@@ -271,39 +234,47 @@ static void VPNHookSensors(void) {
 __attribute__((constructor))
 static void VPNEntry(void) {
     gStart = CFAbsoluteTimeGetCurrent();
-    VPNLog(@"========== VPNAdBlock v9 loaded, LEVEL=2 ==========");
+    VPNLog([NSString stringWithFormat:@"========== VPNAdBlock v10 loaded, LEVEL=%d ==========", VPN_LEVEL]);
 
     dispatch_async(dispatch_get_main_queue(), ^{
         VPNHookSensors();
         VPNHookViewController();
     });
 
-#if SHOW_BADGE
-    // 角标重试（不引用数组，避免 block 捕获 C 数组报错）
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ VPNShowBadge(); });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ VPNShowBadge(); });
+    // banner 清扫：多次补扫，覆盖懒加载轮播
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ VPNSweepAll(); });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ VPNShowBadge(); });
+                   dispatch_get_main_queue(), ^{ VPNSweepAll(); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(7.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ VPNSweepAll(); });
+
+#if VPN_LEVEL >= 3
+    // 推荐面板兜底：定时扫描顶级 VC，防 viewDidAppear 漏掉
+    for (int i = 0; i < 20; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((3.0 + i * 3.0) * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try {
+                for (UIWindow *w in VPNWindows()) {
+                    if (w.windowLevel >= UIWindowLevelAlert) continue;
+                    UIViewController *root = w.rootViewController;
+                    if (!root) continue;
+                    UIViewController *top = root;
+                    int guard = 0;
+                    while (top.presentedViewController && guard++ < 8) {
+                        top = top.presentedViewController;
+                    }
+                    NSString *tn = NSStringFromClass([top class]);
+                    if (VPNIsSheetVC(tn) && top.view && !top.view.isHidden) {
+                        VPNLogOnce([@"fb|" stringByAppendingString:tn],
+                                   [NSString stringWithFormat:@"HIDE[sheet-fallback]: %@", tn]);
+                        top.view.hidden = YES;
+                        top.view.alpha = 0.0;
+                        top.view.userInteractionEnabled = NO;
+                    }
+                }
+            } @catch (NSException *e) {}
+        });
+    }
 #endif
-
-    // 三个时间点，确保覆盖首页（开屏页可能持续数秒）
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        VPNDumpNow(@"t3s");
-        VPNSweepAll();
-    });
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        VPNDumpNow(@"t6s");
-        VPNSweepAll();
-    });
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        VPNDumpNow(@"t10s");
-        VPNSweepAll();
-    });
 }
