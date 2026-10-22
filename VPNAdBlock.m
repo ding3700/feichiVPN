@@ -1,15 +1,11 @@
-/* VPNAdBlock v12 —— 零闪现 + 自动关闭
+/* VPNAdBlock v13 —— 收尾优化版
  *
- * v11 已解决：banner 零闪现、推荐面板全程透明
- * v11 遗留：透明面板的「系统遮罩容器」仍在拦截点击，需多点一次
- *
- * v12 新增：隐藏 view 后主动 dismiss
- *   注意区分两种操作：
- *     拦截 present  —— present 从未发生，Swift 强解包 presentedViewController 会崩
- *     present 后 dismiss —— 等价于用户手动关闭，Swift 自己就在等这个动作，安全
- *
- *   现在 sheet 已走完 willAppear→didAppear 全流程，dismiss 属于正常生命周期操作。
- *   用 animated:NO 避免关闭动画期间访问已释放的转场上下文。
+ * v12 已解决：banner 零闪现、推荐面板自动关闭
+ * v13 优化：
+ *   ① VPN_DEBUG 默认 0 —— 彻底零日志 I/O，启动最快
+ *   ② 兜底轮次 20 → 12，间隔不变，仍覆盖 36 秒
+ *   ③ 新增 KILL_ANNOUNCEMENT：顺手干掉「欢迎使用迅驰加速器」全屏弹窗
+ *      （AnnouncementPopupView，日志实测 {{0,0},{428,926}}）
  */
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -23,14 +19,19 @@
 //  3 = banner + 推荐面板  ★
 #define VPN_LEVEL 3
 
-// 即时隐藏（零闪现核心）
+// 即时隐藏（零闪现核心，必须开）
 #define INSTANT_HIDE 1
 
 // 隐藏后自动 dismiss（消除多余点击）
-// 若发现关闭瞬间闪退，改 0 退回「只隐藏」
 #define DISMISS_SHEET 1
 
-#define VPN_DEBUG 1
+// 顺手干掉欢迎弹窗 AnnouncementPopupView
+// 想保留它（比如要看公告）就改 0
+#define KILL_ANNOUNCEMENT 1
+
+// 日志。日常用 0（零开销）；排查问题时改回 1
+#define VPN_DEBUG 0
+
 static const NSTimeInterval kSensorBlockSeconds = 10.0;
 
 #pragma mark - 日志
@@ -64,17 +65,24 @@ static void VPNLog(NSString *line) {
 
 static NSMutableSet *gLogged;
 static void VPNLogOnce(NSString *key, NSString *line) {
+#if VPN_DEBUG
     static dispatch_once_t once;
     dispatch_once(&once, ^{ gLogged = [[NSMutableSet alloc] init]; });
     if ([gLogged containsObject:key]) return;
     [gLogged addObject:key];
     VPNLog(line);
+#endif
 }
 
 #pragma mark - 类名（实测锁定）
 
 static NSString * const BANNER_KEYS[] = { @"HomeBannerCarousel", @"HomeBannerCell", nil };
 static NSString * const SHEET_KEYS[]  = { @"RecommendationsSheet", nil };
+#if KILL_ANNOUNCEMENT
+static NSString * const POPUP_KEYS[]  = { @"AnnouncementPopup", nil };
+#endif
+
+// 绝不碰：正常功能
 static NSString * const SAFE_KEYS[]   = {
     @"RewardCelebration", @"FloatingClaim", @"Claim", @"Reward",
     @"Sign", @"CheckIn", @"Member", @"Vip", nil
@@ -100,7 +108,11 @@ static BOOL VPNIsBannerName(NSString *cls) {
     if (VPNIsKitClass(cls)) return NO;
     if (VPNHit(cls, SAFE_KEYS)) return NO;
     if (VPNHit(cls, EXCLUDE)) return NO;
-    return VPNHit(cls, BANNER_KEYS);
+    if (VPNHit(cls, BANNER_KEYS)) return YES;
+#if KILL_ANNOUNCEMENT
+    if (VPNHit(cls, POPUP_KEYS)) return YES;
+#endif
+    return NO;
 }
 static BOOL VPNIsSheetVC(NSString *cls) {
     if (cls.length == 0) return NO;
@@ -214,7 +226,7 @@ static void VPNHookViewWillAppear(void) {
             NSString *vcName = NSStringFromClass([self class]);
             if (VPNIsSheetVC(vcName)) {
                 UIView *v = ((UIViewController *)self).view;
-                if (v) v.alpha = 0.0;   // 动画开始前就透明，全程不可见
+                if (v) v.alpha = 0.0;
                 VPNLogOnce([@"wa|" stringByAppendingString:vcName],
                            [NSString stringWithFormat:@"SHEET pre-alpha0: %@", vcName]);
             }
@@ -248,24 +260,17 @@ static void VPNHookViewDidAppear(void) {
                         v.alpha = 0.0;
                         v.userInteractionEnabled = NO;
                     }
-
 #if DISMISS_SHEET
-                    // 再延迟一拍，确保转场上下文完全稳定后再关闭
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                                    dispatch_get_main_queue(), ^{
                         @try {
                             UIViewController *cur = weakVC;
                             if (!cur) return;
-                            // 只有仍处于被 present 状态才关闭
                             if (cur.presentingViewController || cur.navigationController) {
                                 VPNLog([NSString stringWithFormat:@"SHEET dismiss: %@", vcName]);
                                 [cur dismissViewControllerAnimated:NO completion:nil];
-                            } else {
-                                VPNLog(@"SHEET skip dismiss: no presenting VC");
                             }
-                        } @catch (NSException *e) {
-                            VPNLog(@"dismiss exception (ignored)");
-                        }
+                        } @catch (NSException *e) {}
                     });
 #endif
                 });
@@ -302,7 +307,7 @@ static void VPNHookSensors(void) {
 __attribute__((constructor))
 static void VPNEntry(void) {
     gStart = CFAbsoluteTimeGetCurrent();
-    VPNLog([NSString stringWithFormat:@"========== VPNAdBlock v12 loaded, LEVEL=%d ==========", VPN_LEVEL]);
+    VPNLog([NSString stringWithFormat:@"========== VPNAdBlock v13 loaded, LEVEL=%d ==========", VPN_LEVEL]);
 
     dispatch_async(dispatch_get_main_queue(), ^{
         VPNHookSensors();
@@ -317,7 +322,8 @@ static void VPNEntry(void) {
                    dispatch_get_main_queue(), ^{ VPNSweepAll(); });
 
 #if VPN_LEVEL >= 3
-    for (int i = 0; i < 20; i++) {
+    // 兜底：12 轮 × 3 秒 = 覆盖 36 秒
+    for (int i = 0; i < 12; i++) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((3.0 + i * 3.0) * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             @try {
