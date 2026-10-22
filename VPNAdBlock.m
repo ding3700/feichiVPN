@@ -1,14 +1,7 @@
-/* VPNAdBlock v7 —— 飞驰 VPN（XunchiVPN）
- *
- * 实测情报：
- *   首页顶部/底部 banner = HomeBannerCell / HomeBannerCarousel
- *   「推荐」面板（点免费领会员 / 开始连接 后弹出）= 弹窗类
- *   「今日已领取」对话框 = 正常功能，不是广告，不碰
- *
- * v7 关键修正：
- *   ① 删除 presentViewController 拦截 —— 阻塞展示会导致 Swift 强解包崩溃
- *   ② 只做「展示完成后隐藏」，绝不阻塞
- *   ③ banner 与弹窗分级，可分别测试
+/* VPNAdBlock v8 —— 诊断版
+ * v7 修复了闪退（删 present 拦截），但清扫没命中。
+ * v8 加诊断输出：window 情况 + 真实类名，一次看清真相。
+ * 同时修复角标强引用 bug。
  */
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -16,20 +9,20 @@
 #import <CoreMotion/CoreMotion.h>
 #import <CoreFoundation/CoreFoundation.h>
 
-//  0 = 空壳，零 hook
-//  1 = 只拦摇一摇
-//  2 = + 只隐藏首页 banner（完全不碰弹窗）★ 先用这个
-//  3 = + 弹窗延迟隐藏（展示完成后才藏）
-//  4 = + 位置识别兜底
-//  5 = 屏幕 dump
+//  0 = 空壳
+//  1 = 摇一摇
+//  2 = banner + 诊断输出 ★ 默认
+//  3 = + 弹窗
+//  4 = + 位置识别
 #define VPN_LEVEL 2
 
 #define VPN_DEBUG 1
-#define SHOW_BADGE 1        // 绿色角标，确认插件加载；确认后改 0
-#define BANNER_BY_POSITION 1
+#define SHOW_BADGE 1
+#define DUMP_VIEWS 1     // 输出视图树到日志 ★ 关键
+#define BANNER_BY_POSITION 0   // 先关掉，避免误伤干扰诊断
 static const NSTimeInterval kSensorBlockSeconds = 10.0;
 
-#pragma mark - 日志（同步写三处）
+#pragma mark - 日志
 
 static NSString *VPNPath(NSString *k) {
     if ([k isEqualToString:@"doc"])
@@ -74,66 +67,48 @@ static void VPNLogOnce(NSString *key, NSString *line) {
 
 #pragma mark - 类名
 
-// 首页 banner（图20）
 static NSString * const BANNER_KEYS[] = {
-    @"HomeBannerCell",
-    @"HomeBannerCarousel",
-    nil
+    @"HomeBannerCell", @"HomeBannerCarousel", @"HomeBanner", @"BannerCell", @"BannerCarousel", nil
 };
-// 弹窗（图22 推荐面板）—— 仅 LEVEL>=3 才处理
 static NSString * const POPUP_KEYS[] = {
-    @"AnnouncementPopupView",
-    @"Recommend",
-    nil
-};
-// 通用语义兜底，仅 LEVEL>=4
-static NSString * const SEMANTIC_KEYS[] = {
-    @"Banner", @"AdView", @"Advert", @"Promot", @"Sponsor", nil
+    @"AnnouncementPopupView", @"Recommend", @"Popup", nil
 };
 static NSString * const EXCLUDE[] = {
     @"Address", @"Adapter", @"Adaptor", @"Advanced", @"Advisory",
     @"Add", @"Read", @"Load", @"Shadow", @"Gradient", @"Badge", @"Header", @"Trade", nil
 };
-// 绝不处理：正常功能弹窗（图21 今日已领取）
 static NSString * const SAFE[] = {
-    @"Claim", @"Reward", @"Sign", @"CheckIn", @"Member", @"Vip", @"Toast", @"Alert", nil
+    @"Claim", @"Reward", @"Sign", @"CheckIn", @"Member", @"Vip", @"Toast", nil
 };
 
 static BOOL VPNHit(NSString *cls, NSString *const keys[]) {
     if (cls.length == 0) return NO;
-    for (int i = 0; keys[i]; i++) {
-        if ([cls rangeOfString:keys[i]].length > 0) return YES;
-    }
+    for (int i = 0; keys[i]; i++) if ([cls rangeOfString:keys[i]].length > 0) return YES;
     return NO;
 }
 static BOOL VPNIsSystem(NSString *cls) {
-    return ([cls hasPrefix:@"UI"] || [cls hasPrefix:@"CA"] || [cls hasPrefix:@"NS"] ||
-            [cls hasPrefix:@"WK"] || [cls hasPrefix:@"_"] || [cls hasPrefix:@"SwiftUI"]);
+    if ([cls hasPrefix:@"UI"] || [cls hasPrefix:@"CA"] || [cls hasPrefix:@"NS"] ||
+        [cls hasPrefix:@"WK"] || [cls hasPrefix:@"_"] || [cls hasPrefix:@"SwiftUI"]) return YES;
+    // Swift 内部类型
+    if ([cls hasPrefix:@"Swift."] || [cls hasPrefix:@"__"]) return YES;
+    return NO;
 }
-static BOOL VPNIsSafe(NSString *cls) {
-    return VPNHit(cls, SAFE);
-}
+static BOOL VPNIsSafe(NSString *cls) { return VPNHit(cls, SAFE); }
+static BOOL VPNIsExcluded(NSString *cls) { return VPNHit(cls, EXCLUDE); }
 
 static BOOL VPNIsBanner(UIView *v) {
     if (!v) return NO;
     NSString *cls = NSStringFromClass([v class]);
-    if (VPNIsSystem(cls) || VPNIsSafe(cls)) return NO;
-    for (int i = 0; EXCLUDE[i]; i++) if ([cls rangeOfString:EXCLUDE[i]].length > 0) return NO;
-    if (VPNHit(cls, BANNER_KEYS)) return YES;
-#if VPN_LEVEL >= 4
-    if (VPNHit(cls, SEMANTIC_KEYS)) return YES;
-#endif
-    return NO;
+    if (VPNIsSystem(cls) || VPNIsSafe(cls) || VPNIsExcluded(cls)) return NO;
+    return VPNHit(cls, BANNER_KEYS);
 }
-
 static BOOL VPNIsPopup(UIView *v) {
 #if VPN_LEVEL < 3
     return NO;
 #else
     if (!v) return NO;
     NSString *cls = NSStringFromClass([v class]);
-    if (VPNIsSystem(cls) || VPNIsSafe(cls)) return NO;
-    for (int i = 0; EXCLUDE[i]; i++) if ([cls rangeOfString:EXCLUDE[i]].length > 0) return NO;
+    if (VPNIsSystem(cls) || VPNIsSafe(cls) || VPNIsExcluded(cls)) return NO;
     return VPNHit(cls, POPUP_KEYS);
 #endif
 }
@@ -155,22 +130,38 @@ static BOOL VPNLooksLikeDockBanner(UIView *v) {
     CGFloat sh = MAX(sb.size.width, sb.size.height);
     if (f.size.width < sw * 0.85) return NO;
     if (!(f.size.height >= 40.0 && f.size.height <= 170.0)) return NO;
-    BOOL atTop = (f.origin.y <= 140.0);
-    BOOL atBottom = ((f.origin.y + f.size.height) >= sh - 140.0);
-    return (atTop || atBottom);
+    return ((f.origin.y <= 140.0) || ((f.origin.y + f.size.height) >= sh - 140.0));
 #endif
 }
 
-#pragma mark - 清扫（只隐藏，不移除、不改 frame）
+#pragma mark - 隐藏
 
 static void VPNHideView(UIView *v, NSString *reason) {
     if (!v || v.isHidden) return;
-    VPNLogOnce([@"h|" stringByAppendingString:NSStringFromClass([v class])],
-               [NSString stringWithFormat:@"hide[%@]: %@", reason, NSStringFromClass([v class])]);
+    VPNLog([NSString stringWithFormat:@"HIDE[%@]: %@", reason, NSStringFromClass([v class])]);
     v.hidden = YES;
     v.alpha = 0.0;
     v.userInteractionEnabled = NO;
 }
+
+#pragma mark - 诊断 dump
+
+#if DUMP_VIEWS
+static int gDumpCount;
+static void VPNDumpTree(UIView *root, int depth) {
+    if (!root || depth > 7 || gDumpCount > 150) return;
+    NSString *cls = NSStringFromClass([root class]);
+    // 只记录非系统类，且数量受控
+    if (!VPNIsSystem(cls)) {
+        NSMutableString *pad = [NSMutableString string];
+        for (int i = 0; i < depth; i++) [pad appendString:@"  "];
+        NSString *mark = VPNIsBanner(root) ? @" <<<BANNER" : @"";
+        VPNLog([NSString stringWithFormat:@"%@%@%@", pad, cls, mark]);
+        gDumpCount++;
+    }
+    for (UIView *sub in root.subviews) VPNDumpTree(sub, depth + 1);
+}
+#endif
 
 static NSArray *VPNWindows(void) {
     NSMutableArray *out = [NSMutableArray array];
@@ -187,7 +178,14 @@ static NSArray *VPNWindows(void) {
     return out;
 }
 
-// includePopup=NO 时只清 banner（安全模式）
+// 放宽：只跳过 Alert 及以上（系统弹窗），不再用 +1.0
+static BOOL VPNWindowScannable(UIWindow *w) {
+    if (![w isKindOfClass:[UIWindow class]]) return NO;
+    if (w.windowLevel >= UIWindowLevelAlert) return NO;
+    if ([w.rootViewController isKindOfClass:[UIAlertController class]]) return NO;
+    return YES;
+}
+
 static void VPNSweepWith(UIView *root, int depth, BOOL includePopup) {
     if (!root || depth > 8) return;
     for (UIView *v in root.subviews) {
@@ -199,49 +197,45 @@ static void VPNSweepWith(UIView *root, int depth, BOOL includePopup) {
     }
 }
 
-// 只扫 App 主窗口，跳过系统 Alert / 浮层
 static void VPNSweepSafe(void) {
-    for (UIWindow *w in VPNWindows()) {
-        if (![w isKindOfClass:[UIWindow class]]) continue;
-        if (w.windowLevel > UIWindowLevelNormal + 1.0) continue;
-        VPNSweepWith(w, 0, NO);   // 安全模式：只清 banner
+    NSArray *wins = VPNWindows();
+    for (UIWindow *w in wins) {
+        if (!VPNWindowScannable(w)) {
+            VPNLog([NSString stringWithFormat:@"SKIP window level=%.1f root=%@",
+                    w.windowLevel, NSStringFromClass([w.rootViewController class])]);
+            continue;
+        }
+        VPNSweepWith(w, 0, NO);
     }
 }
 
-// 弹窗清扫：只在展示完成后调用
-static void VPNSweepPopup(void) {
-#if VPN_LEVEL >= 3
-    for (UIWindow *w in VPNWindows()) {
-        if (![w isKindOfClass:[UIWindow class]]) continue;
-        if ([w.rootViewController isKindOfClass:[UIAlertController class]]) continue;
-        VPNSweepWith(w, 0, YES);
-    }
-#endif
-}
-
-#pragma mark - 绿色角标（确认插件加载）
+#pragma mark - 角标（修复强引用）
 
 #if SHOW_BADGE
+static UIWindow *gBadgeWindow = nil;   // ★ static 强引用，防止被释放
 static void VPNShowBadge(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *w = [[UIWindow alloc] initWithFrame:CGRectMake(6, 60, 96, 26)];
+        if (gBadgeWindow) return;
+        UIWindow *w = [[UIWindow alloc] initWithFrame:CGRectMake(6, 60, 100, 28)];
         w.windowLevel = UIWindowLevelStatusBar + 100;
-        w.backgroundColor = [[UIColor greenColor] colorWithAlphaComponent:0.85];
-        w.userInteractionEnabled = NO;   // 不挡触摸
+        w.backgroundColor = [[UIColor greenColor] colorWithAlphaComponent:0.9];
+        w.userInteractionEnabled = NO;
         UILabel *lb = [[UILabel alloc] initWithFrame:w.bounds];
         lb.text = @"VPN✓";
         lb.textColor = [UIColor blackColor];
-        lb.font = [UIFont boldSystemFontOfSize:13];
+        lb.font = [UIFont boldSystemFontOfSize:14];
         lb.textAlignment = NSTextAlignmentCenter;
         UIViewController *vc = [UIViewController new];
         vc.view.backgroundColor = [UIColor clearColor];
         [vc.view addSubview:lb];
         w.rootViewController = vc;
+        gBadgeWindow = w;          // ★ 持有
         w.hidden = NO;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            w.hidden = YES;
-            w.rootViewController = nil;
+            gBadgeWindow.hidden = YES;
+            gBadgeWindow.rootViewController = nil;
+            gBadgeWindow = nil;
         });
     });
 }
@@ -271,14 +265,13 @@ static void VPNHookSensors(void) {
 __attribute__((constructor))
 static void VPNEntry(void) {
     gStart = CFAbsoluteTimeGetCurrent();
-    VPNLog([NSString stringWithFormat:@"========== VPNAdBlock v7 loaded, LEVEL=%d ==========", VPN_LEVEL]);
-    VPNLog([NSString stringWithFormat:@"日志文件: %@", VPNPath(@"doc")]);
+    VPNLog([NSString stringWithFormat:@"========== VPNAdBlock v8 loaded, LEVEL=%d ==========", VPN_LEVEL]);
 
 #if VPN_LEVEL == 0
-    VPNLog(@"LEVEL 0: 零 hook。若仍闪退 = 注入本身问题。");
 #if SHOW_BADGE
     VPNShowBadge();
 #endif
+    VPNLog(@"LEVEL 0");
     return;
 #endif
 
@@ -289,27 +282,38 @@ static void VPNEntry(void) {
 #endif
     });
 
-    // 首页 banner：展示完成后清扫，安全
-    NSTimeInterval safeDelays[] = {1.0, 2.5, 5.0, 9.0};
+    // 诊断：2 秒时 dump 一次完整视图树
+#if DUMP_VIEWS
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        gDumpCount = 0;
+        NSArray *wins = VPNWindows();
+        VPNLog([NSString stringWithFormat:@"--- DUMP BEGIN windows=%lu ---", (unsigned long)wins.count]);
+        for (UIWindow *w in wins) {
+            VPNLog([NSString stringWithFormat:@"[WIN] %@ level=%.1f root=%@ frame=%@ scannable=%d",
+                    NSStringFromClass([w class]), w.windowLevel,
+                    NSStringFromClass([w.rootViewController class]),
+                    NSStringFromCGRect(w.frame), VPNWindowScannable(w)]);
+            VPNDumpTree(w, 1);
+        }
+        VPNLog(@"--- DUMP END ---");
+    });
+#endif
+
+    // 清扫
+    NSTimeInterval delays[] = {1.5, 3.0, 5.0, 9.0};
     for (int i = 0; i < 4; i++) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(safeDelays[i] * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delays[i] * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ VPNSweepSafe(); });
     }
 
 #if VPN_LEVEL >= 3
-    // 弹窗：只在展示完成后（延迟 2s）才隐藏，绝不阻塞 present
-    // 之后每 2 秒复查一次，持续 60 秒，覆盖随时弹出的推荐面板
-    __block int round = 0;
-    __block void (^recheck)(void) = ^{
-        if (round++ > 30) { return; }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            VPNSweepPopup();
-        });
-    };
     for (int i = 0; i < 30; i++) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((2.0 + i * 2.0) * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ VPNSweepPopup(); });
+                       dispatch_get_main_queue(), ^{
+            for (UIWindow *w in VPNWindows()) {
+                if (VPNWindowScannable(w)) VPNSweepWith(w, 0, YES);
+            }
+        });
     }
 #endif
 }
